@@ -1,0 +1,2049 @@
+<!DOCTYPE html>
+<!--
+================================================================================
+NYC SUBWAY REAL-TIME ARRIVAL DISPLAY
+Manhattan Station Selector Edition
+================================================================================
+
+FEATURES:
+- Tap station name to select from all Manhattan subway stations
+- Classic NYC subway styling with Helvetica typography
+- Real-time MTA GTFS-RT feed parsing
+- Robust error recovery with exponential backoff
+- Debounced updates to prevent UI thrashing
+- RequestAnimationFrame for smoother rendering
+- Better memory management (object pooling, avoiding allocations)
+- Stale data detection and handling
+- Network status monitoring with offline banner
+- Graceful degradation when feeds are unavailable
+- Optimized DOM operations with DocumentFragment
+- Auto page refresh every 4 hours for long-running displays
+- Feed timestamp validation to detect stale API data
+- Automatic cleanup of departed trains
+- 5-second render cycle for accurate countdown times
+- Station selection persists in localStorage
+
+DATA ACCURACY SAFEGUARDS:
+- Validates MTA feed timestamps to detect stale data
+- Filters arrivals >60 min in future as likely erroneous
+- Tracks individual feed health per feed type
+- Shows partial data warnings when feeds fail
+- 3-minute stale data threshold with visual indicator
+- Automatic retry with exponential backoff on failures
+
+SETUP INSTRUCTIONS:
+1. Host this file on a web server (local or remote)
+2. Open in a fullscreen/kiosk browser on your tablet
+3. Tap the station name to change stations
+4. Optional URL params: ?station=A18&count=2&refresh=60000
+
+================================================================================
+-->
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1024, height=600, initial-scale=1.0, user-scalable=no">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>NYC Subway - Real-Time Arrivals</title>
+    
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="theme-color" content="#000000">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
+    
+    <style>
+        :root {
+            --mta-orange: #FF6319;
+            --mta-blue: #0039A6;
+            --mta-black: #000000;
+            --mta-white: #FFFFFF;
+            --mta-green: #00933C;
+            --mta-yellow: #FCCC0A;
+            --mta-red: #EE352E;
+            --mta-purple: #B933AD;
+            --mta-gray: #808183;
+            --mta-brown: #996633;
+            --mta-light-green: #6CBE45;
+            --subway-font: Helvetica Neue, Helvetica, Arial, sans-serif;
+            --arriving-green: #00FF00;
+            --arriving-soon-yellow: #FFDD00;
+            --error-red: #FF4444;
+            --warning-orange: #FFAA00;
+            --ok-green: #00AA00;
+            --stale-purple: #AA44AA;
+            --bg-primary: #000000;
+            --bg-elevated: rgba(255, 255, 255, 0.02);
+            --bg-highlight: rgba(255, 255, 255, 0.06);
+            --text-primary: #FFFFFF;
+            --text-secondary: #888888;
+            --text-muted: #666666;
+            --text-dim: #555555;
+            --text-faint: #444444;
+            --border-subtle: #333333;
+            --font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        }
+        
+        *, *::before, *::after {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 1024px;
+            height: 600px;
+            overflow: hidden;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: var(--font-family);
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        .container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+            padding: 8px 20px 10px;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding-bottom: 10px;
+            border-bottom: 1px solid var(--border-subtle);
+            margin-bottom: 8px;
+            flex-shrink: 0;
+        }
+        
+        .station-name {
+            font-family: var(--subway-font);
+            font-size: 42px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            color: var(--mta-white);
+            background-color: var(--mta-black);
+            padding: 6px 24px;
+            border-radius: 24px;
+            border: 3px solid var(--mta-white);
+            text-transform: none;
+            cursor: pointer;
+            transition: background-color 0.2s ease, transform 0.1s ease;
+            user-select: none;
+        }
+        
+        .station-name:hover {
+            background-color: #222;
+        }
+        
+        .station-name:active {
+            transform: scale(0.98);
+        }
+        
+        .clock {
+            font-size: 18px;
+            font-weight: 400;
+            color: var(--text-muted);
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .arrivals-container {
+            flex: 1;
+            display: flex;
+            gap: 20px;
+        }
+        
+        .direction-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .direction-header {
+            font-size: 28px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 6px;
+            color: var(--text-secondary);
+            padding: 8px 0;
+            margin-bottom: 10px;
+            text-align: center;
+        }
+        
+        .direction-header .arrow {
+            margin-right: 6px;
+        }
+        
+        .trains-list {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        
+        .train-row {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            padding: 10px 20px;
+            background: var(--bg-elevated);
+            border-radius: 8px;
+            min-height: 120px;
+            transition: background-color 0.3s ease, opacity 0.3s ease;
+            will-change: background-color, opacity;
+        }
+        
+        .train-row.arriving {
+            background: var(--bg-highlight);
+        }
+        
+        .train-row.stale {
+            opacity: 0.5;
+        }
+        
+        .train-badge {
+            width: 110px;
+            height: 110px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 72px;
+            font-weight: 700;
+            color: var(--text-primary);
+            flex-shrink: 0;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+        }
+        
+        /* Train line colors */
+        .train-badge.A, .train-badge.C, .train-badge.E { background-color: var(--mta-blue); }
+        .train-badge.B, .train-badge.D, .train-badge.F, .train-badge.M { background-color: var(--mta-orange); }
+        .train-badge.G { background-color: var(--mta-light-green); }
+        .train-badge.J, .train-badge.Z { background-color: var(--mta-brown); color: var(--mta-black); }
+        .train-badge.L { background-color: var(--mta-gray); }
+        .train-badge.N, .train-badge.Q, .train-badge.R, .train-badge.W { background-color: var(--mta-yellow); color: var(--mta-black); }
+        .train-badge.S { background-color: var(--mta-gray); }
+        .train-badge[class*="1"], .train-badge[class*="2"], .train-badge[class*="3"] { background-color: var(--mta-red); }
+        .train-badge[class*="4"], .train-badge[class*="5"], .train-badge[class*="6"] { background-color: var(--mta-green); }
+        .train-badge[class*="7"] { background-color: var(--mta-purple); }
+        .train-badge.empty {
+            background: #222222;
+            color: var(--text-faint);
+        }
+        
+        .train-info {
+            flex: 1;
+            margin-left: 24px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        
+        .train-destination {
+            font-size: 20px;
+            font-weight: 400;
+            color: var(--text-secondary);
+            margin-bottom: 2px;
+            letter-spacing: 0.5px;
+        }
+        
+        .train-time {
+            font-size: 90px;
+            font-weight: 700;
+            letter-spacing: -3px;
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+        
+        .train-time .unit {
+            font-size: 42px;
+            font-weight: 400;
+            margin-left: 6px;
+            color: var(--text-muted);
+            letter-spacing: 0;
+        }
+        
+        .train-time.arriving-now {
+            color: var(--arriving-green);
+            font-size: 64px;
+            letter-spacing: -1px;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
+        .train-time.arriving-soon {
+            color: var(--arriving-soon-yellow);
+        }
+        
+        .train-time.no-trains {
+            font-size: 28px;
+            color: var(--text-faint);
+            letter-spacing: 0;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .divider {
+            width: 2px;
+            background: linear-gradient(
+                to bottom,
+                transparent 0%,
+                var(--border-subtle) 15%,
+                var(--border-subtle) 85%,
+                transparent 100%
+            );
+        }
+        
+        .footer {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding-top: 6px;
+            flex-shrink: 0;
+        }
+        
+        .status {
+            font-size: 12px;
+            color: var(--text-faint);
+            display: flex;
+            align-items: center;
+        }
+        
+        .status.error { color: var(--error-red); }
+        .status.loading { color: var(--warning-orange); }
+        .status.stale { color: var(--stale-purple); }
+        
+        .status .indicator {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            margin-right: 6px;
+            background: var(--ok-green);
+        }
+        
+        .status.error .indicator { background: var(--error-red); }
+        .status.stale .indicator { background: var(--stale-purple); }
+        .status.loading .indicator {
+            background: var(--warning-orange);
+            animation: blink 1s ease-in-out infinite;
+        }
+        
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        
+        .error-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.95);
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 100;
+        }
+        
+        .error-overlay.visible {
+            display: flex;
+        }
+        
+        .error-message {
+            font-size: 32px;
+            color: #FF6666;
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        
+        .error-detail {
+            font-size: 18px;
+            color: var(--text-secondary);
+            text-align: center;
+        }
+        
+        .retry-indicator {
+            margin-top: 25px;
+            font-size: 14px;
+            color: var(--text-dim);
+        }
+        
+        .offline-banner {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: var(--error-red);
+            color: white;
+            text-align: center;
+            padding: 4px;
+            font-size: 12px;
+            font-weight: 700;
+            z-index: 101;
+            display: none;
+        }
+        
+        .offline-banner.visible {
+            display: block;
+        }
+        
+        /* Station Selector Modal */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.9);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 200;
+        }
+        
+        .modal-overlay.visible {
+            display: flex;
+        }
+        
+        .modal {
+            background: #111;
+            border-radius: 16px;
+            width: 90%;
+            max-width: 800px;
+            max-height: 80%;
+            display: flex;
+            flex-direction: column;
+            border: 2px solid #333;
+            overflow: hidden;
+        }
+        
+        .modal-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+        
+        .modal-title {
+            font-family: var(--subway-font);
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+        
+        .modal-close {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 32px;
+            cursor: pointer;
+            padding: 0 8px;
+            line-height: 1;
+        }
+        
+        .modal-close:hover {
+            color: var(--text-primary);
+        }
+        
+        .search-box {
+            padding: 16px 24px;
+            border-bottom: 1px solid #333;
+            flex-shrink: 0;
+        }
+        
+        .search-input {
+            width: 100%;
+            padding: 12px 16px;
+            font-size: 18px;
+            background: #222;
+            border: 1px solid #444;
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-family: var(--font-family);
+        }
+        
+        .search-input:focus {
+            outline: none;
+            border-color: var(--mta-blue);
+        }
+        
+        .search-input::placeholder {
+            color: var(--text-dim);
+        }
+        
+        .station-list {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 0;
+            min-height: 0;
+        }
+        
+        .station-item {
+            padding: 14px 24px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            transition: background-color 0.15s ease;
+        }
+        
+        .station-item:hover {
+            background: #222;
+        }
+        
+        .station-item.selected {
+            background: #1a3a5c;
+        }
+        
+        .station-routes {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        
+        .route-badge {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            font-weight: 700;
+            color: white;
+        }
+        
+        .route-badge.rt-A, .route-badge.rt-C, .route-badge.rt-E { background-color: var(--mta-blue); }
+        .route-badge.rt-B, .route-badge.rt-D, .route-badge.rt-F, .route-badge.rt-M { background-color: var(--mta-orange); }
+        .route-badge.rt-G { background-color: var(--mta-light-green); }
+        .route-badge.rt-J, .route-badge.rt-Z { background-color: var(--mta-brown); color: var(--mta-black); }
+        .route-badge.rt-L { background-color: var(--mta-gray); }
+        .route-badge.rt-N, .route-badge.rt-Q, .route-badge.rt-R, .route-badge.rt-W { background-color: var(--mta-yellow); color: var(--mta-black); }
+        .route-badge.rt-S { background-color: var(--mta-gray); }
+        .route-badge.rt-1, .route-badge.rt-2, .route-badge.rt-3 { background-color: var(--mta-red); }
+        .route-badge.rt-4, .route-badge.rt-5, .route-badge.rt-6 { background-color: var(--mta-green); }
+        .route-badge.rt-7 { background-color: var(--mta-purple); }
+        
+        .station-name-text {
+            font-size: 18px;
+            color: var(--text-primary);
+        }
+        
+        .no-results {
+            padding: 40px 24px;
+            text-align: center;
+            color: var(--text-dim);
+            font-size: 16px;
+        }
+        
+        .borough-tabs {
+            display: flex;
+            gap: 8px;
+            padding: 12px 24px;
+            border-bottom: 1px solid #333;
+            overflow-x: auto;
+            flex-shrink: 0;
+        }
+        
+        .borough-tab {
+            background: #222;
+            border: 1px solid #444;
+            color: var(--text-secondary);
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-family: var(--font-family);
+            white-space: nowrap;
+            transition: all 0.15s ease;
+        }
+        
+        .borough-tab:hover {
+            background: #333;
+            color: var(--text-primary);
+        }
+        
+        .borough-tab.active {
+            background: var(--mta-blue);
+            border-color: var(--mta-blue);
+            color: white;
+        }
+        
+        .borough-header {
+            padding: 12px 24px 8px;
+            font-size: 13px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: var(--text-dim);
+            background: #1a1a1a;
+            border-bottom: 1px solid #333;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+    </style>
+</head>
+<body>
+    <div class="offline-banner" id="offline-banner">OFFLINE - Waiting for connection...</div>
+    
+    <div class="container">
+        <header class="header">
+            <h1 class="station-name" id="station-name" title="Tap to change station">103 St</h1>
+            <time class="clock" id="clock">--:--</time>
+        </header>
+        
+        <main class="arrivals-container">
+            <section class="direction-column">
+                <h2 class="direction-header" id="north-label">
+                    <span class="arrow">↑</span><span id="north-text">Uptown</span>
+                </h2>
+                <div class="trains-list" id="uptown-trains"></div>
+            </section>
+            
+            <div class="divider"></div>
+            
+            <section class="direction-column">
+                <h2 class="direction-header" id="south-label">
+                    <span class="arrow">↓</span><span id="south-text">Downtown</span>
+                </h2>
+                <div class="trains-list" id="downtown-trains"></div>
+            </section>
+        </main>
+        
+        <footer class="footer">
+            <div class="status" id="status">
+                <span class="indicator"></span>
+                <span class="text">Initializing...</span>
+            </div>
+        </footer>
+    </div>
+    
+    <div class="error-overlay" id="error-overlay">
+        <div class="error-message">Data temporarily unavailable</div>
+        <div class="error-detail" id="error-detail">Please check your connection</div>
+        <div class="retry-indicator" id="retry-indicator">Retrying automatically...</div>
+    </div>
+    
+    <!-- Station Selector Modal -->
+    <div class="modal-overlay" id="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <span class="modal-title">Select Station</span>
+                <button class="modal-close" id="modal-close">&times;</button>
+            </div>
+            <div class="search-box">
+                <input type="text" class="search-input" id="search-input" placeholder="Search stations...">
+            </div>
+            <div class="borough-tabs" id="borough-tabs">
+                <button class="borough-tab active" data-borough="all">All</button>
+                <button class="borough-tab" data-borough="Manhattan">Manhattan</button>
+                <button class="borough-tab" data-borough="Bronx">Bronx</button>
+                <button class="borough-tab" data-borough="Queens">Queens</button>
+                <button class="borough-tab" data-borough="Brooklyn">Brooklyn</button>
+            </div>
+            <div class="station-list" id="station-list"></div>
+        </div>
+    </div>
+
+    <script>
+        'use strict';
+        
+        /**
+         * ================================================================
+         * NYC SUBWAY STATIONS DATABASE - ALL BOROUGHS
+         * Complete list of Manhattan, Bronx, Queens, and Brooklyn stations
+         * ================================================================
+         */
+        const NYC_STATIONS = [
+            // ============== MANHATTAN ==============
+            { id: 'A18', name: '103 St', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '119', name: '103 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '624', name: '103 St', routes: ['6'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'Q05', name: '96 St', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A19', name: '96 St', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '625', name: '96 St', routes: ['6'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'Q04', name: '86 St', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A20', name: '86 St', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '121', name: '86 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '626', name: '86 St', routes: ['4', '5', '6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A21', name: '81 St-Museum of Natural History', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '122', name: '79 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '627', name: '77 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A22', name: '72 St', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '123', name: '72 St', routes: ['1', '2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'Q03', name: '72 St', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '628', name: '68 St-Hunter College', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '124', name: '66 St-Lincoln Center', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'B08', name: 'Lexington Av/63 St', routes: ['F', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Uptown & Queens', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '629', name: '59 St', routes: ['4', '5', '6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A24', name: '59 St-Columbus Circle', routes: ['A', 'B', 'C', 'D'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '125', name: '59 St-Columbus Circle', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R11', name: 'Lexington Av/59 St', routes: ['N', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Queens', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R13', name: '5 Av/59 St', routes: ['N', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Queens', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R14', name: '57 St-7 Av', routes: ['N', 'Q', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'B10', name: '57 St', routes: ['F'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '631', name: 'Grand Central-42 St', routes: ['4', '5', '6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '723', name: 'Grand Central-42 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Queens', southLabel: 'Hudson Yards', borough: 'Manhattan' },
+            { id: '901', name: 'Grand Central-42 St', routes: ['S'], feeds: ['numbered'], northLabel: 'Times Square', southLabel: 'Last Stop', borough: 'Manhattan' },
+            { id: 'F11', name: 'Lexington Av/53 St', routes: ['E', 'M'], feeds: ['ace', 'bdfm'], northLabel: 'Queens', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'F12', name: '5 Av/53 St', routes: ['E', 'M'], feeds: ['ace', 'bdfm'], northLabel: 'Queens', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A25', name: '50 St', routes: ['C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '127', name: 'Times Sq-42 St', routes: ['1', '2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R16', name: 'Times Sq-42 St', routes: ['N', 'Q', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A27', name: '42 St-Port Authority', routes: ['A', 'C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '725', name: 'Times Sq-42 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Queens', southLabel: 'Hudson Yards', borough: 'Manhattan' },
+            { id: '902', name: 'Times Sq-42 St', routes: ['S'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Grand Central', borough: 'Manhattan' },
+            { id: 'D15', name: '47-50 Sts-Rockefeller Ctr', routes: ['B', 'D', 'F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R15', name: '49 St', routes: ['N', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D16', name: '42 St-Bryant Pk', routes: ['B', 'D', 'F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '724', name: '5 Av', routes: ['7'], feeds: ['numbered'], northLabel: 'Queens', southLabel: 'Hudson Yards', borough: 'Manhattan' },
+            { id: '726', name: '34 St-Hudson Yards', routes: ['7'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Queens', borough: 'Manhattan' },
+            { id: '128', name: '34 St-Penn Station', routes: ['1', '2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A28', name: '34 St-Penn Station', routes: ['A', 'C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R17', name: '34 St-Herald Sq', routes: ['N', 'Q', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D17', name: '34 St-Herald Sq', routes: ['B', 'D', 'F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '632', name: '33 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '129', name: '28 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '633', name: '28 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R18', name: '28 St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A30', name: '23 St', routes: ['C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '130', name: '23 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '634', name: '23 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R19', name: '23 St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D18', name: '23 St', routes: ['F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '131', name: '18 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'L02', name: '6 Av', routes: ['L'], feeds: ['l'], northLabel: '8 Av', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: '132', name: '14 St', routes: ['1', '2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A31', name: '14 St', routes: ['A', 'C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D19', name: '14 St', routes: ['F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'L03', name: '14 St-Union Sq', routes: ['L'], feeds: ['l'], northLabel: '8 Av', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'R20', name: '14 St-Union Sq', routes: ['N', 'Q', 'R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '635', name: '14 St-Union Sq', routes: ['4', '5', '6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '133', name: 'Christopher St-Stonewall', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A32', name: 'W 4 St-Wash Sq', routes: ['A', 'C', 'E', 'B', 'D', 'F', 'M'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'L05', name: '3 Av', routes: ['L'], feeds: ['l'], northLabel: '8 Av', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'L06', name: '1 Av', routes: ['L'], feeds: ['l'], northLabel: '8 Av', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'R21', name: '8 St-NYU', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '636', name: 'Astor Pl', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '637', name: 'Bleecker St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D21', name: 'Broadway-Lafayette St', routes: ['B', 'D', 'F', 'M'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '134', name: 'Houston St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'F15', name: 'Delancey St-Essex St', routes: ['F'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'M18', name: 'Essex St', routes: ['J', 'M', 'Z'], feeds: ['jz', 'bdfm'], northLabel: 'Brooklyn', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D22', name: 'Grand St', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'A33', name: 'Spring St', routes: ['C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '638', name: 'Spring St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R22', name: 'Prince St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '135', name: 'Canal St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A34', name: 'Canal St', routes: ['A', 'C', 'E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R23', name: 'Canal St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'Q01', name: 'Canal St', routes: ['N', 'Q'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '639', name: 'Canal St', routes: ['6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'M20', name: 'Canal St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Brooklyn', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'F16', name: 'East Broadway', routes: ['F'], feeds: ['bdfm'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: '136', name: 'Franklin St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'M21', name: 'Chambers St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Brooklyn', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A36', name: 'Chambers St', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: '640', name: 'Brooklyn Bridge-City Hall', routes: ['4', '5', '6'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R24', name: 'City Hall', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '138', name: 'WTC Cortlandt', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'E01', name: 'World Trade Center', routes: ['E'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Last Stop', borough: 'Manhattan' },
+            { id: 'R25', name: 'Cortlandt St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A38', name: 'Fulton St', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: '418', name: 'Fulton St', routes: ['4', '5'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '229', name: 'Fulton St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'M22', name: 'Fulton St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Brooklyn', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '139', name: 'Rector St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'R26', name: 'Rector St', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '419', name: 'Wall St', routes: ['4', '5'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '230', name: 'Wall St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Brooklyn', borough: 'Manhattan' },
+            { id: 'M23', name: 'Broad St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Brooklyn', southLabel: 'Last Stop', borough: 'Manhattan' },
+            { id: 'R27', name: 'Whitehall St-South Ferry', routes: ['R', 'W'], feeds: ['nqrw'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '142', name: 'South Ferry', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Last Stop', borough: 'Manhattan' },
+            { id: '420', name: 'Bowling Green', routes: ['4', '5'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '116', name: '125 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A15', name: '125 St', routes: ['A', 'B', 'C', 'D'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '225', name: '125 St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A16', name: '116 St', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '622', name: '116 St', routes: ['6'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '226', name: '116 St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '117', name: '116 St-Columbia University', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A17', name: 'Cathedral Pkwy (110 St)', routes: ['B', 'C'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '623', name: '110 St', routes: ['6'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '227', name: '110 St-Central Park North', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '118', name: 'Cathedral Pkwy (110 St)', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '115', name: '137 St-City College', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '302', name: '145 St', routes: ['3'], feeds: ['numbered'], northLabel: 'Harlem', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D13', name: '145 St', routes: ['A', 'B', 'C', 'D'], feeds: ['ace', 'bdfm'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '114', name: '145 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '301', name: 'Harlem-148 St', routes: ['3'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'D12', name: '155 St', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '113', name: '157 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A10', name: '163 St-Amsterdam Av', routes: ['C'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A09', name: '168 St', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '112', name: '168 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A07', name: '175 St', routes: ['A'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '111', name: '181 St', routes: ['1'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A06', name: '181 St', routes: ['A'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A05', name: '190 St', routes: ['A'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '110', name: '191 St', routes: ['1'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A03', name: 'Dyckman St', routes: ['A'], feeds: ['ace'], northLabel: 'Uptown', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '109', name: 'Dyckman St', routes: ['1'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: '108', name: '207 St', routes: ['1'], feeds: ['numbered'], northLabel: 'The Bronx', southLabel: 'Downtown', borough: 'Manhattan' },
+            { id: 'A02', name: 'Inwood-207 St', routes: ['A'], feeds: ['ace'], northLabel: 'Last Stop', southLabel: 'Downtown', borough: 'Manhattan' },
+
+            // ============== BRONX ==============
+            { id: '101', name: 'Van Cortlandt Park-242 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '103', name: '238 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Van Cortlandt', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '106', name: 'Marble Hill-225 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '107', name: '215 St', routes: ['1'], feeds: ['numbered'], northLabel: 'Uptown', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '201', name: 'Wakefield-241 St', routes: ['2'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '204', name: 'Nereid Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '205', name: '233 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '206', name: '225 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '207', name: '219 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '208', name: 'Gun Hill Rd', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '209', name: 'Burke Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '210', name: 'Allerton Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '211', name: 'Pelham Pkwy', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '212', name: 'Bronx Park East', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '213', name: 'E 180 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '214', name: 'West Farms Sq-E Tremont Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '215', name: '174 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '217', name: 'Simpson St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '218', name: 'Intervale Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '219', name: 'Prospect Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '221', name: '3 Av-149 St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '222', name: '149 St-Grand Concourse', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '401', name: 'Woodlawn', routes: ['4'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '402', name: 'Mosholu Pkwy', routes: ['4'], feeds: ['numbered'], northLabel: 'Woodlawn', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '405', name: 'Bedford Park Blvd-Lehman College', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '406', name: 'Kingsbridge Rd', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '407', name: 'Fordham Rd', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '408', name: '183 St', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '409', name: 'Burnside Av', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '410', name: '176 St', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '411', name: 'Mt Eden Av', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '412', name: '170 St', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '413', name: '167 St', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '414', name: '161 St-Yankee Stadium', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '415', name: '149 St-Grand Concourse', routes: ['4'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '416', name: '138 St-Grand Concourse', routes: ['4', '5'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '501', name: 'Eastchester-Dyre Av', routes: ['5'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '502', name: 'Baychester Av', routes: ['5'], feeds: ['numbered'], northLabel: 'Eastchester', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '503', name: 'Gun Hill Rd', routes: ['5'], feeds: ['numbered'], northLabel: 'Eastchester', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '504', name: 'Pelham Pkwy', routes: ['5'], feeds: ['numbered'], northLabel: 'Eastchester', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '505', name: 'Morris Park', routes: ['5'], feeds: ['numbered'], northLabel: 'Eastchester', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '601', name: 'Pelham Bay Park', routes: ['6'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '602', name: 'Buhre Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Pelham Bay', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '603', name: 'Middletown Rd', routes: ['6'], feeds: ['numbered'], northLabel: 'Pelham Bay', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '604', name: 'Westchester Sq-E Tremont Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Pelham Bay', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '606', name: 'Zerega Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Pelham Bay', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '607', name: 'Castle Hill Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Pelham Bay', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '608', name: 'Parkchester', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '609', name: 'St Lawrence Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '610', name: 'Morrison Av-Soundview', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '611', name: 'Elder Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '613', name: 'Hunts Point Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '614', name: 'Longwood Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '615', name: 'E 149 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '617', name: 'Cypress Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '618', name: 'Brook Av', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: '619', name: '3 Av-138 St', routes: ['6'], feeds: ['numbered'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D03', name: 'Bedford Park Blvd', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D04', name: 'Kingsbridge Rd', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D05', name: 'Fordham Rd', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D06', name: '182-183 Sts', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D08', name: '174-175 Sts', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D09', name: '170 St', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D10', name: '167 St', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+            { id: 'D11', name: '161 St-Yankee Stadium', routes: ['B', 'D'], feeds: ['bdfm'], northLabel: 'Northbound', southLabel: 'Manhattan', borough: 'Bronx' },
+
+            // ============== QUEENS ==============
+            { id: '701', name: 'Flushing-Main St', routes: ['7'], feeds: ['numbered'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '702', name: 'Mets-Willets Point', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '705', name: '111 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '706', name: '103 St-Corona Plaza', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '707', name: 'Junction Blvd', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '708', name: '90 St-Elmhurst Av', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '709', name: '82 St-Jackson Hts', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '710', name: '74 St-Broadway', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '711', name: '69 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '712', name: 'Woodside-61 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '713', name: '52 St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '714', name: '46 St-Bliss St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '715', name: '40 St-Lowery St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '716', name: '33 St-Rawson St', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '719', name: 'Court Sq', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: '720', name: 'Hunters Point Av', routes: ['7'], feeds: ['numbered'], northLabel: 'Flushing', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R01', name: 'Astoria-Ditmars Blvd', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R03', name: 'Astoria Blvd', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Ditmars Blvd', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R04', name: '30 Av', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Astoria', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R05', name: 'Broadway', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Astoria', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R06', name: '36 Av', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Astoria', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R08', name: '39 Av-Dutch Kills', routes: ['N', 'W'], feeds: ['nqrw'], northLabel: 'Astoria', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'R09', name: 'Queensboro Plaza', routes: ['N', 'W', '7'], feeds: ['nqrw', 'numbered'], northLabel: 'Astoria', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G05', name: 'Jamaica Center-Parsons/Archer', routes: ['E', 'J', 'Z'], feeds: ['ace', 'jz'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G06', name: 'Sutphin Blvd-Archer Av-JFK', routes: ['E', 'J', 'Z'], feeds: ['ace', 'jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G07', name: 'Jamaica-Van Wyck', routes: ['E'], feeds: ['ace'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G08', name: 'Forest Hills-71 Av', routes: ['E', 'F', 'M', 'R'], feeds: ['ace', 'bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G09', name: '67 Av', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G11', name: 'Woodhaven Blvd', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G12', name: 'Grand Av-Newtown', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G13', name: 'Elmhurst Av', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G14', name: 'Jackson Hts-Roosevelt Av', routes: ['E', 'F', 'M', 'R'], feeds: ['ace', 'bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G15', name: '65 St', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G16', name: 'Northern Blvd', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G18', name: '46 St', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G19', name: 'Steinway St', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G20', name: '36 St', routes: ['M', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G21', name: 'Queens Plaza', routes: ['E', 'M', 'R'], feeds: ['ace', 'bdfm', 'nqrw'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'G22', name: 'Court Sq', routes: ['E', 'M', 'G'], feeds: ['ace', 'bdfm', 'g'], northLabel: 'Last Stop', southLabel: 'Brooklyn', borough: 'Queens' },
+            { id: 'G24', name: '21 St', routes: ['G'], feeds: ['g'], northLabel: 'Court Square', southLabel: 'Brooklyn', borough: 'Queens' },
+            { id: 'G26', name: 'Greenpoint Av', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Queens' },
+            { id: 'B04', name: '21 St-Queensbridge', routes: ['F'], feeds: ['bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F01', name: 'Jamaica-179 St', routes: ['F'], feeds: ['bdfm'], northLabel: 'Last Stop', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F02', name: '169 St', routes: ['F'], feeds: ['bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F03', name: 'Parsons Blvd', routes: ['F'], feeds: ['bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F04', name: 'Sutphin Blvd', routes: ['F'], feeds: ['bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F05', name: 'Briarwood', routes: ['E', 'F'], feeds: ['ace', 'bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F06', name: 'Kew Gardens-Union Tpke', routes: ['E', 'F'], feeds: ['ace', 'bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F07', name: '75 Av', routes: ['E', 'F'], feeds: ['ace', 'bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'F09', name: 'Court Sq-23 St', routes: ['E', 'M'], feeds: ['ace', 'bdfm'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J12', name: '121 St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J13', name: '111 St', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J14', name: '104 St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J15', name: 'Woodhaven Blvd', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J16', name: '85 St-Forest Pkwy', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J17', name: '75 St-Elderts Ln', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'J19', name: 'Cypress Hills', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Queens' },
+            { id: 'A61', name: 'Rockaway Blvd', routes: ['A'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Rockaway', borough: 'Queens' },
+            { id: 'A65', name: 'Ozone Park-Lefferts Blvd', routes: ['A'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Queens' },
+            { id: 'H03', name: 'Howard Beach-JFK Airport', routes: ['A'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Rockaways', borough: 'Queens' },
+            { id: 'H04', name: 'Broad Channel', routes: ['A', 'S'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Rockaways', borough: 'Queens' },
+            { id: 'H11', name: 'Far Rockaway-Mott Av', routes: ['A'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Queens' },
+            { id: 'H15', name: 'Rockaway Park-Beach 116 St', routes: ['A', 'S'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Queens' },
+
+            // ============== BROOKLYN ==============
+            { id: 'A40', name: 'High St', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A41', name: 'Jay St-MetroTech', routes: ['A', 'C', 'F'], feeds: ['ace', 'bdfm'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A42', name: 'Hoyt-Schermerhorn Sts', routes: ['A', 'C', 'G'], feeds: ['ace', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A46', name: 'Nostrand Av', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A48', name: 'Utica Av', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A51', name: 'Broadway Junction', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A55', name: 'Euclid Av', routes: ['A', 'C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: 'R29', name: 'Jay St-MetroTech', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R30', name: 'DeKalb Av', routes: ['B', 'Q', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R31', name: 'Atlantic Av-Barclays Ctr', routes: ['D', 'N', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R36', name: '36 St', routes: ['D', 'N', 'R'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R41', name: '59 St', routes: ['N', 'R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R45', name: 'Bay Ridge-95 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: 'D24', name: 'Atlantic Av-Barclays Ctr', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'D26', name: 'Prospect Park', routes: ['B', 'Q', 'S'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'D39', name: 'Sheepshead Bay', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'D40', name: 'Brighton Beach', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'D43', name: 'Coney Island-Stillwell Av', routes: ['D', 'F', 'N', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: 'F18', name: 'York St', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F20', name: 'Bergen St', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F22', name: 'Smith-9 Sts', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F24', name: '7 Av', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F27', name: 'Church Av', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G29', name: 'Metropolitan Av', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G30', name: 'Broadway', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G31', name: 'Flushing Av', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G33', name: 'Bedford-Nostrand Avs', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G36', name: 'Fulton St', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '231', name: 'Clark St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '232', name: 'Borough Hall', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '234', name: 'Nevins St', routes: ['2', '3', '4', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '235', name: 'Atlantic Av-Barclays Ctr', routes: ['2', '3', '4', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '236', name: 'Bergen St', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '237', name: 'Grand Army Plaza', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '238', name: 'Eastern Pkwy-Brooklyn Museum', routes: ['2', '3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '239', name: 'Franklin Av', routes: ['2', '3', '4', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '241', name: 'President St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '242', name: 'Sterling St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '243', name: 'Winthrop St', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '244', name: 'Church Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '245', name: 'Beverly Rd', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '246', name: 'Newkirk Av', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Flatbush', borough: 'Brooklyn' },
+            { id: '247', name: 'Flatbush Av-Brooklyn College', routes: ['2', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: '248', name: 'Nostrand Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '249', name: 'Kingston Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '250', name: 'Crown Hts-Utica Av', routes: ['3', '4'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: '251', name: 'Sutter Av-Rutland Rd', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '252', name: 'Saratoga Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '253', name: 'Rockaway Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '254', name: 'Junius St', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '255', name: 'Pennsylvania Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '256', name: 'Van Siclen Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'New Lots', borough: 'Brooklyn' },
+            { id: '257', name: 'New Lots Av', routes: ['3'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: '423', name: 'Borough Hall', routes: ['4', '5'], feeds: ['numbered'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'R32', name: 'Union St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R33', name: '9 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R34', name: 'Prospect Av', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R35', name: '25 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R39', name: '45 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R40', name: '53 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R42', name: 'Bay Ridge Av', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R43', name: '77 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'R44', name: '86 St', routes: ['R'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Bay Ridge', borough: 'Brooklyn' },
+            { id: 'D25', name: '7 Av', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'D27', name: 'Parkside Av', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D28', name: 'Church Av', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D29', name: 'Beverley Rd', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D30', name: 'Cortelyou Rd', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D31', name: 'Newkirk Plaza', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D32', name: 'Avenue H', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D33', name: 'Avenue J', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D34', name: 'Avenue M', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D35', name: 'Kings Hwy', routes: ['B', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D37', name: 'Avenue U', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D38', name: 'Neck Rd', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Brighton', borough: 'Brooklyn' },
+            { id: 'D41', name: 'Ocean Pkwy', routes: ['Q'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'D42', name: 'W 8 St-NY Aquarium', routes: ['F', 'Q'], feeds: ['bdfm', 'nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N02', name: '8 Av', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N03', name: 'Fort Hamilton Pkwy', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N04', name: 'New Utrecht Av', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N05', name: '18 Av', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N06', name: '20 Av', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N07', name: 'Bay Pkwy', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N08', name: 'Kings Hwy', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N09', name: 'Avenue U', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'N10', name: '86 St', routes: ['N'], feeds: ['nqrw'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F21', name: 'Carroll St', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F23', name: '4 Av-9 St', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F25', name: '15 St-Prospect Park', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F26', name: 'Fort Hamilton Pkwy', routes: ['F', 'G'], feeds: ['bdfm', 'g'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'F29', name: 'Ditmas Av', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F30', name: '18 Av', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F31', name: 'Avenue I', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F32', name: 'Bay Pkwy', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F33', name: 'Avenue N', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F34', name: 'Avenue P', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F35', name: 'Kings Hwy', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F36', name: 'Avenue U', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F38', name: 'Avenue X', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'F39', name: 'Neptune Av', routes: ['F'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Coney Island', borough: 'Brooklyn' },
+            { id: 'G28', name: 'Nassau Av', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G32', name: 'Myrtle-Willoughby Avs', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G34', name: 'Classon Av', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'G35', name: 'Clinton-Washington Avs', routes: ['G'], feeds: ['g'], northLabel: 'Queens', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'L08', name: 'Bedford Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L10', name: 'Lorimer St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L11', name: 'Graham Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L12', name: 'Grand St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L13', name: 'Montrose Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L14', name: 'Morgan Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L15', name: 'Jefferson St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L16', name: 'DeKalb Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L17', name: 'Myrtle-Wyckoff Avs', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L19', name: 'Halsey St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L20', name: 'Wilson Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L21', name: 'Bushwick Av-Aberdeen St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L22', name: 'Broadway Junction', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L24', name: 'Atlantic Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L25', name: 'Sutter Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L26', name: 'Livonia Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L27', name: 'New Lots Av', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L28', name: 'East 105 St', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Canarsie', borough: 'Brooklyn' },
+            { id: 'L29', name: 'Canarsie-Rockaway Pkwy', routes: ['L'], feeds: ['l'], northLabel: 'Manhattan', southLabel: 'Last Stop', borough: 'Brooklyn' },
+            { id: 'A43', name: 'Lafayette Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A44', name: 'Clinton-Washington Avs', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A47', name: 'Kingston-Throop Avs', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'A49', name: 'Ralph Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Euclid', borough: 'Brooklyn' },
+            { id: 'A50', name: 'Rockaway Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Euclid', borough: 'Brooklyn' },
+            { id: 'A52', name: 'Liberty Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Euclid', borough: 'Brooklyn' },
+            { id: 'A53', name: 'Van Siclen Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Euclid', borough: 'Brooklyn' },
+            { id: 'A54', name: 'Shepherd Av', routes: ['C'], feeds: ['ace'], northLabel: 'Manhattan', southLabel: 'Euclid', borough: 'Brooklyn' },
+            { id: 'M08', name: 'Myrtle-Wyckoff Avs', routes: ['M'], feeds: ['bdfm'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'M11', name: 'Myrtle Av', routes: ['M', 'J', 'Z'], feeds: ['bdfm', 'jz'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'M12', name: 'Flushing Av', routes: ['M', 'J'], feeds: ['bdfm', 'jz'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'M14', name: 'Lorimer St', routes: ['M', 'J'], feeds: ['bdfm', 'jz'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'M16', name: 'Marcy Av', routes: ['M', 'J', 'Z'], feeds: ['bdfm', 'jz'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'M18', name: 'Hewes St', routes: ['M', 'J'], feeds: ['bdfm', 'jz'], northLabel: 'Manhattan', southLabel: 'Brooklyn', borough: 'Brooklyn' },
+            { id: 'J20', name: 'Crescent St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J21', name: 'Norwood Av', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J22', name: 'Cleveland St', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J23', name: 'Van Siclen Av', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J24', name: 'Alabama Av', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J27', name: 'Broadway Junction', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J28', name: 'Chauncey St', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J29', name: 'Halsey St', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J30', name: 'Gates Av', routes: ['J', 'Z'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+            { id: 'J31', name: 'Kosciuszko St', routes: ['J'], feeds: ['jz'], northLabel: 'Jamaica', southLabel: 'Manhattan', borough: 'Brooklyn' },
+        ];
+        
+        /**
+         * ================================================================
+         * FEED CONFIGURATION
+         * ================================================================
+         */
+        const FEED_URLS = {
+            ace: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-ace',
+            bdfm: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-bdfm',
+            g: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-g',
+            jz: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-jz',
+            nqrw: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-nqrw',
+            l: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs-l',
+            numbered: 'https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2Fgtfs'
+        };
+        
+        /**
+         * ================================================================
+         * CONFIGURATION
+         * ================================================================
+         */
+        const urlParams = new URLSearchParams(window.location.search);
+        
+        const CONFIG = {
+            STATION_ID: urlParams.get('station') || localStorage.getItem('selectedStation') || 'A18',
+            REFRESH_INTERVAL: Math.max(30000, parseInt(urlParams.get('refresh')) || 60000),
+            TRAINS_PER_DIRECTION: Math.min(4, Math.max(1, parseInt(urlParams.get('count')) || 2)),
+            RETRY_DELAY_BASE: 5000,
+            RETRY_DELAY_MAX: 60000,
+            MAX_RETRIES: 5,
+            FETCH_TIMEOUT: 15000,
+            STALE_DATA_THRESHOLD: 180000,
+            RENDER_DEBOUNCE: 100,
+            CLOCK_UPDATE_INTERVAL: 1000
+        };
+        
+        // Get current station config
+        function getCurrentStationConfig() {
+            return NYC_STATIONS.find(s => s.id === CONFIG.STATION_ID) || NYC_STATIONS[0];
+        }
+
+        /**
+         * ================================================================
+         * DOM CACHE
+         * ================================================================
+         */
+        const DOM = {
+            stationName: null,
+            uptownTrains: null,
+            downtownTrains: null,
+            northText: null,
+            southText: null,
+            clock: null,
+            status: null,
+            statusText: null,
+            errorOverlay: null,
+            errorDetail: null,
+            retryIndicator: null,
+            offlineBanner: null,
+            modalOverlay: null,
+            modalClose: null,
+            searchInput: null,
+            stationList: null
+        };
+        
+        function cacheDOMRefs() {
+            DOM.stationName = document.getElementById('station-name');
+            DOM.uptownTrains = document.getElementById('uptown-trains');
+            DOM.downtownTrains = document.getElementById('downtown-trains');
+            DOM.northText = document.getElementById('north-text');
+            DOM.southText = document.getElementById('south-text');
+            DOM.clock = document.getElementById('clock');
+            DOM.status = document.getElementById('status');
+            DOM.statusText = DOM.status?.querySelector('.text');
+            DOM.errorOverlay = document.getElementById('error-overlay');
+            DOM.errorDetail = document.getElementById('error-detail');
+            DOM.retryIndicator = document.getElementById('retry-indicator');
+            DOM.offlineBanner = document.getElementById('offline-banner');
+            DOM.modalOverlay = document.getElementById('modal-overlay');
+            DOM.modalClose = document.getElementById('modal-close');
+            DOM.searchInput = document.getElementById('search-input');
+            DOM.stationList = document.getElementById('station-list');
+        }
+
+        /**
+         * ================================================================
+         * STATION SELECTOR
+         * ================================================================
+         */
+        function openStationSelector() {
+            DOM.modalOverlay.classList.add('visible');
+            DOM.searchInput.value = '';
+            DOM.searchInput.focus();
+            renderStationList('');
+        }
+        
+        function closeStationSelector() {
+            DOM.modalOverlay.classList.remove('visible');
+        }
+        
+        // Current borough filter
+        let currentBoroughFilter = 'all';
+        
+        function renderStationList(filter) {
+            const searchTerm = filter.toLowerCase().trim();
+            const filtered = NYC_STATIONS.filter(station => {
+                // Borough filter
+                if (currentBoroughFilter !== 'all' && station.borough !== currentBoroughFilter) {
+                    return false;
+                }
+                // Search filter
+                if (!searchTerm) return true;
+                return station.name.toLowerCase().includes(searchTerm) ||
+                       station.routes.some(r => r.toLowerCase() === searchTerm) ||
+                       (station.borough && station.borough.toLowerCase().includes(searchTerm));
+            });
+            
+            if (filtered.length === 0) {
+                DOM.stationList.innerHTML = '<div class="no-results">No stations found</div>';
+                return;
+            }
+            
+            // Sort by borough then name
+            filtered.sort((a, b) => {
+                if (a.borough !== b.borough) {
+                    const order = ['Manhattan', 'Bronx', 'Queens', 'Brooklyn'];
+                    return order.indexOf(a.borough) - order.indexOf(b.borough);
+                }
+                return a.name.localeCompare(b.name);
+            });
+            
+            // Group by borough for display
+            let currentBorough = '';
+            const html = filtered.map(station => {
+                const routeBadges = station.routes.map(r => 
+                    `<span class="route-badge rt-${r}">${r}</span>`
+                ).join('');
+                
+                const isSelected = station.id === CONFIG.STATION_ID;
+                
+                // Add borough header if changed and showing all
+                let boroughHeader = '';
+                if (currentBoroughFilter === 'all' && station.borough !== currentBorough) {
+                    currentBorough = station.borough;
+                    boroughHeader = `<div class="borough-header">${station.borough}</div>`;
+                }
+                
+                return `
+                    ${boroughHeader}
+                    <div class="station-item ${isSelected ? 'selected' : ''}" data-station-id="${station.id}">
+                        <div class="station-routes">${routeBadges}</div>
+                        <span class="station-name-text">${station.name}</span>
+                    </div>
+                `;
+            }).join('');
+            
+            DOM.stationList.innerHTML = html;
+        }
+        
+        function selectStation(stationId) {
+            const station = NYC_STATIONS.find(s => s.id === stationId);
+            if (!station) return;
+            
+            CONFIG.STATION_ID = stationId;
+            localStorage.setItem('selectedStation', stationId);
+            
+            // Update UI
+            DOM.stationName.textContent = station.name;
+            DOM.northText.textContent = station.northLabel;
+            DOM.southText.textContent = station.southLabel;
+            document.title = `${station.name} - Real-Time Arrivals`;
+            
+            // Close modal and refresh data
+            closeStationSelector();
+            state.arrivals = { uptown: [], downtown: [] };
+            scheduleRender();
+            fetchAllArrivals();
+        }
+        
+        function initStationSelector() {
+            // Open modal on station name click
+            DOM.stationName.addEventListener('click', openStationSelector);
+            
+            // Close modal
+            DOM.modalClose.addEventListener('click', closeStationSelector);
+            DOM.modalOverlay.addEventListener('click', (e) => {
+                if (e.target === DOM.modalOverlay) closeStationSelector();
+            });
+            
+            // Search functionality
+            DOM.searchInput.addEventListener('input', (e) => {
+                renderStationList(e.target.value);
+            });
+            
+            // Borough tab filtering
+            const boroughTabs = document.getElementById('borough-tabs');
+            boroughTabs.addEventListener('click', (e) => {
+                const tab = e.target.closest('.borough-tab');
+                if (tab) {
+                    // Update active state
+                    boroughTabs.querySelectorAll('.borough-tab').forEach(t => t.classList.remove('active'));
+                    tab.classList.add('active');
+                    
+                    // Update filter and re-render
+                    currentBoroughFilter = tab.dataset.borough;
+                    renderStationList(DOM.searchInput.value);
+                }
+            });
+            
+            // Station selection
+            DOM.stationList.addEventListener('click', (e) => {
+                const item = e.target.closest('.station-item');
+                if (item) {
+                    selectStation(item.dataset.stationId);
+                }
+            });
+            
+            // Escape key closes modal
+            document.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape' && DOM.modalOverlay.classList.contains('visible')) {
+                    closeStationSelector();
+                }
+            });
+            
+            // Initialize station display
+            const station = getCurrentStationConfig();
+            DOM.stationName.textContent = station.name;
+            DOM.northText.textContent = station.northLabel;
+            DOM.southText.textContent = station.southLabel;
+            document.title = `${station.name} - Real-Time Arrivals`;
+        }
+
+        /**
+         * ================================================================
+         * UTILITY FUNCTIONS
+         * ================================================================
+         */
+        
+        function debounce(fn, delay) {
+            let timeoutId = null;
+            let pendingArgs = null;
+            
+            const execute = () => {
+                if (pendingArgs !== null) {
+                    fn.apply(null, pendingArgs);
+                    pendingArgs = null;
+                }
+                timeoutId = null;
+            };
+            
+            return function(...args) {
+                pendingArgs = args;
+                if (timeoutId === null) {
+                    timeoutId = setTimeout(execute, delay);
+                }
+            };
+        }
+        
+        function getBackoffDelay(retryCount) {
+            const delay = CONFIG.RETRY_DELAY_BASE * Math.pow(2, retryCount);
+            return Math.min(delay, CONFIG.RETRY_DELAY_MAX);
+        }
+
+        /**
+         * ================================================================
+         * ROBUST PROTOBUF DECODER FOR GTFS-RT
+         * ================================================================
+         */
+        class ProtobufDecoder {
+            static textDecoder = new TextDecoder('utf-8', { fatal: false });
+            
+            constructor(buffer) {
+                if (buffer instanceof Uint8Array) {
+                    this.buffer = buffer;
+                } else if (buffer instanceof ArrayBuffer) {
+                    this.buffer = new Uint8Array(buffer);
+                } else {
+                    this.buffer = new Uint8Array(0);
+                }
+                this.pos = 0;
+                this.length = this.buffer.length;
+            }
+            
+            canRead(n = 1) {
+                return this.pos + n <= this.length;
+            }
+            
+            readVarint() {
+                let result = 0;
+                let shift = 0;
+                const maxShift = 35;
+                
+                while (shift < maxShift && this.canRead()) {
+                    const byte = this.buffer[this.pos++];
+                    result |= (byte & 0x7F) << shift;
+                    
+                    if ((byte & 0x80) === 0) {
+                        return result >>> 0;
+                    }
+                    shift += 7;
+                }
+                
+                return result >>> 0;
+            }
+            
+            readVarint64() {
+                let lo = 0;
+                let hi = 0;
+                let shift = 0;
+                
+                while (shift < 28 && this.canRead()) {
+                    const byte = this.buffer[this.pos++];
+                    lo |= (byte & 0x7F) << shift;
+                    if ((byte & 0x80) === 0) return lo >>> 0;
+                    shift += 7;
+                }
+                
+                if (!this.canRead()) return lo >>> 0;
+                let byte = this.buffer[this.pos++];
+                lo |= (byte & 0x0F) << 28;
+                hi = (byte & 0x70) >> 4;
+                
+                if ((byte & 0x80) === 0) {
+                    return hi * 0x100000000 + (lo >>> 0);
+                }
+                
+                shift = 3;
+                while (shift < 32 && this.canRead()) {
+                    byte = this.buffer[this.pos++];
+                    hi |= (byte & 0x7F) << shift;
+                    if ((byte & 0x80) === 0) break;
+                    shift += 7;
+                }
+                
+                return hi * 0x100000000 + (lo >>> 0);
+            }
+            
+            readBytes() {
+                const len = this.readVarint();
+                if (len <= 0) return new Uint8Array(0);
+                const available = this.length - this.pos;
+                const safeLen = Math.min(len, available);
+                if (safeLen <= 0) return new Uint8Array(0);
+                const bytes = this.buffer.subarray(this.pos, this.pos + safeLen);
+                this.pos += safeLen;
+                return bytes;
+            }
+            
+            readString() {
+                const bytes = this.readBytes();
+                if (bytes.length === 0) return '';
+                try {
+                    return ProtobufDecoder.textDecoder.decode(bytes);
+                } catch {
+                    return '';
+                }
+            }
+            
+            skipField(wireType) {
+                switch (wireType) {
+                    case 0: this.readVarint(); break;
+                    case 1: this.pos = Math.min(this.pos + 8, this.length); break;
+                    case 2:
+                        const len = this.readVarint();
+                        this.pos = Math.min(this.pos + Math.max(0, len), this.length);
+                        break;
+                    case 5: this.pos = Math.min(this.pos + 4, this.length); break;
+                    default: this.pos = Math.min(this.pos + 1, this.length);
+                }
+            }
+            
+            parseFeedMessage() {
+                const msg = { header: null, entity: [] };
+                while (this.canRead()) {
+                    const startPos = this.pos;
+                    try {
+                        const tag = this.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 1 && wire === 2) {
+                            msg.header = this.parseHeader(this.readBytes());
+                        } else if (field === 2 && wire === 2) {
+                            const entity = this.parseEntity(this.readBytes());
+                            if (entity) msg.entity.push(entity);
+                        } else {
+                            this.skipField(wire);
+                        }
+                    } catch (e) {
+                        if (this.pos === startPos) this.pos++;
+                    }
+                }
+                return msg;
+            }
+            
+            parseHeader(bytes) {
+                if (!bytes || bytes.length === 0) return {};
+                const d = new ProtobufDecoder(bytes);
+                const h = {};
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 1 && wire === 2) {
+                            h.version = d.readString();
+                        } else if (field === 3 && wire === 0) {
+                            h.timestamp = d.readVarint64();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return h;
+            }
+            
+            parseEntity(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                const d = new ProtobufDecoder(bytes);
+                const e = { id: null, tripUpdate: null };
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 1 && wire === 2) {
+                            e.id = d.readString();
+                        } else if (field === 3 && wire === 2) {
+                            e.tripUpdate = this.parseTripUpdate(d.readBytes());
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return e.tripUpdate ? e : null;
+            }
+            
+            parseTripUpdate(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                const d = new ProtobufDecoder(bytes);
+                const tu = { trip: null, stopTimeUpdate: [] };
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 1 && wire === 2) {
+                            tu.trip = this.parseTripDescriptor(d.readBytes());
+                        } else if (field === 2 && wire === 2) {
+                            const stu = this.parseStopTimeUpdate(d.readBytes());
+                            if (stu) tu.stopTimeUpdate.push(stu);
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return tu;
+            }
+            
+            parseTripDescriptor(bytes) {
+                if (!bytes || bytes.length === 0) return {};
+                const d = new ProtobufDecoder(bytes);
+                const t = {};
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 1 && wire === 2) {
+                            t.tripId = d.readString();
+                        } else if (field === 5 && wire === 2) {
+                            t.routeId = d.readString();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return t;
+            }
+            
+            parseStopTimeUpdate(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                const d = new ProtobufDecoder(bytes);
+                const stu = { stopId: null, arrival: null, departure: null };
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 4 && wire === 2) {
+                            stu.stopId = d.readString();
+                        } else if (field === 2 && wire === 2) {
+                            stu.arrival = this.parseStopTimeEvent(d.readBytes());
+                        } else if (field === 3 && wire === 2) {
+                            stu.departure = this.parseStopTimeEvent(d.readBytes());
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return stu.stopId ? stu : null;
+            }
+            
+            parseStopTimeEvent(bytes) {
+                if (!bytes || bytes.length === 0) return null;
+                const d = new ProtobufDecoder(bytes);
+                const ev = {};
+                while (d.canRead()) {
+                    const startPos = d.pos;
+                    try {
+                        const tag = d.readVarint();
+                        if (tag === 0) break;
+                        const field = tag >>> 3;
+                        const wire = tag & 0x7;
+                        if (field === 2 && wire === 0) {
+                            ev.time = d.readVarint64();
+                        } else if (field === 1 && wire === 0) {
+                            ev.delay = d.readVarint();
+                        } else {
+                            d.skipField(wire);
+                        }
+                    } catch {
+                        if (d.pos === startPos) d.pos++;
+                    }
+                }
+                return ev.time ? ev : null;
+            }
+        }
+
+        /**
+         * ================================================================
+         * APPLICATION STATE
+         * ================================================================
+         */
+        const state = {
+            arrivals: { uptown: [], downtown: [] },
+            lastUpdate: null,
+            lastSuccessfulFetch: null,
+            feedTimestamp: null,
+            error: null,
+            retryCount: 0,
+            isOnline: navigator.onLine,
+            isFetching: false,
+            renderScheduled: false,
+            feedHealth: {}
+        };
+
+        /**
+         * ================================================================
+         * NETWORK MONITORING
+         * ================================================================
+         */
+        function updateOnlineStatus() {
+            state.isOnline = navigator.onLine;
+            if (DOM.offlineBanner) {
+                DOM.offlineBanner.classList.toggle('visible', !state.isOnline);
+            }
+            if (state.isOnline && state.error) {
+                scheduleRefresh(100);
+            }
+        }
+        
+        window.addEventListener('online', updateOnlineStatus);
+        window.addEventListener('offline', updateOnlineStatus);
+
+        /**
+         * ================================================================
+         * API FUNCTIONS
+         * ================================================================
+         */
+        async function fetchWithTimeout(url, timeout) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+            try {
+                const response = await fetch(url, { 
+                    signal: controller.signal,
+                    cache: 'no-store'
+                });
+                return response;
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+        
+        async function fetchFeed(url) {
+            const response = await fetchWithTimeout(url, CONFIG.FETCH_TIMEOUT);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            const buffer = await response.arrayBuffer();
+            if (buffer.byteLength === 0) {
+                throw new Error('Empty response received');
+            }
+            return new ProtobufDecoder(buffer).parseFeedMessage();
+        }
+        
+        function extractArrivals(feed, targetRoutes, stationId) {
+            const arrivals = [];
+            const now = Math.floor(Date.now() / 1000);
+            
+            if (!feed?.entity) return arrivals;
+            
+            const feedTimestamp = feed.header?.timestamp;
+            if (feedTimestamp && (now - feedTimestamp) > 300) {
+                console.warn('Feed data is stale:', now - feedTimestamp, 'seconds old');
+            }
+            if (feedTimestamp) state.feedTimestamp = feedTimestamp;
+            
+            for (let i = 0; i < feed.entity.length; i++) {
+                const entity = feed.entity[i];
+                if (!entity?.tripUpdate?.trip?.routeId) continue;
+                
+                const routeId = entity.tripUpdate.trip.routeId;
+                if (!targetRoutes.includes(routeId)) continue;
+                
+                const stopTimeUpdates = entity.tripUpdate.stopTimeUpdate;
+                if (!stopTimeUpdates) continue;
+                
+                for (let j = 0; j < stopTimeUpdates.length; j++) {
+                    const stu = stopTimeUpdates[j];
+                    if (!stu?.stopId?.startsWith(stationId)) continue;
+                    
+                    const time = stu.arrival?.time ?? stu.departure?.time;
+                    if (!time || time < now - 30) continue;
+                    if (time > now + 3600) continue;
+                    
+                    arrivals.push({
+                        routeId,
+                        direction: stu.stopId.endsWith('N') ? 'N' : 'S',
+                        arrivalTime: time
+                    });
+                }
+            }
+            
+            return arrivals;
+        }
+        
+        async function fetchAllArrivals() {
+            if (state.isFetching) return;
+            if (!state.isOnline) {
+                updateStatus('error', 'Offline');
+                return;
+            }
+            
+            state.isFetching = true;
+            updateStatus('loading', 'Updating...');
+            
+            const station = getCurrentStationConfig();
+            const feedsToFetch = [...new Set(station.feeds)];
+            
+            try {
+                const fetchPromises = feedsToFetch.map(feedKey => 
+                    fetchFeed(FEED_URLS[feedKey])
+                        .then(feed => ({ feedKey, feed, success: true }))
+                        .catch(err => ({ feedKey, error: err, success: false }))
+                );
+                
+                const results = await Promise.all(fetchPromises);
+                
+                const allArrivals = [];
+                let successCount = 0;
+                
+                for (const result of results) {
+                    if (result.success) {
+                        const arrivals = extractArrivals(result.feed, station.routes, station.id);
+                        allArrivals.push(...arrivals);
+                        successCount++;
+                        state.feedHealth[result.feedKey] = true;
+                    } else {
+                        console.warn(`${result.feedKey} feed failed:`, result.error?.message || 'Unknown error');
+                        state.feedHealth[result.feedKey] = false;
+                    }
+                }
+                
+                if (successCount === 0) {
+                    throw new Error('All feeds failed');
+                }
+                
+                state.arrivals.uptown = allArrivals
+                    .filter(a => a.direction === 'N')
+                    .sort((a, b) => a.arrivalTime - b.arrivalTime)
+                    .slice(0, CONFIG.TRAINS_PER_DIRECTION);
+                    
+                state.arrivals.downtown = allArrivals
+                    .filter(a => a.direction === 'S')
+                    .sort((a, b) => a.arrivalTime - b.arrivalTime)
+                    .slice(0, CONFIG.TRAINS_PER_DIRECTION);
+                
+                state.lastUpdate = Date.now();
+                state.lastSuccessfulFetch = Date.now();
+                state.error = null;
+                state.retryCount = 0;
+                
+                DOM.errorOverlay?.classList.remove('visible');
+                
+                if (successCount < feedsToFetch.length) {
+                    updateStatus('stale', `Updated (some feeds unavailable)`);
+                } else {
+                    updateStatus('ok', `Updated ${formatTime(new Date(state.lastUpdate))}`);
+                }
+                
+                scheduleRender();
+                
+            } catch (error) {
+                console.error('Fetch error:', error);
+                state.error = error.message || 'Unknown error';
+                state.retryCount++;
+                
+                const backoffDelay = getBackoffDelay(state.retryCount);
+                
+                if (state.retryCount >= CONFIG.MAX_RETRIES) {
+                    DOM.errorOverlay?.classList.add('visible');
+                    if (DOM.errorDetail) {
+                        DOM.errorDetail.textContent = state.error;
+                    }
+                    if (DOM.retryIndicator) {
+                        DOM.retryIndicator.textContent = `Retrying in ${Math.round(backoffDelay / 1000)}s...`;
+                    }
+                    updateStatus('error', 'Connection error');
+                    scheduleRefresh(backoffDelay);
+                } else {
+                    updateStatus('error', `Retry ${state.retryCount}/${CONFIG.MAX_RETRIES}...`);
+                    scheduleRefresh(backoffDelay);
+                }
+            } finally {
+                state.isFetching = false;
+            }
+        }
+
+        /**
+         * ================================================================
+         * UI RENDERING
+         * ================================================================
+         */
+        
+        function getTimeDisplay(arrivalTime) {
+            const now = Date.now() / 1000;
+            const secondsAway = Math.max(0, arrivalTime - now);
+            const minutesAway = Math.floor(secondsAway / 60);
+            
+            if (secondsAway <= 30) {
+                return { text: 'Arriving', unit: '', className: 'arriving-now' };
+            }
+            if (secondsAway <= 90) {
+                return { text: '<1', unit: 'min', className: 'arriving-soon' };
+            }
+            return { text: String(minutesAway), unit: 'min', className: '' };
+        }
+        
+        function createTrainRowElement(arrival, isStale) {
+            const row = document.createElement('div');
+            
+            if (!arrival) {
+                row.className = 'train-row empty';
+                row.innerHTML = `
+                    <div class="train-badge empty">?</div>
+                    <div class="train-info">
+                        <div class="train-time no-trains">No trains</div>
+                    </div>
+                `;
+                return row;
+            }
+            
+            const timeInfo = getTimeDisplay(arrival.arrivalTime);
+            const isArriving = timeInfo.className === 'arriving-now' || timeInfo.className === 'arriving-soon';
+            
+            const classes = ['train-row'];
+            if (isArriving) classes.push('arriving');
+            if (isStale) classes.push('stale');
+            row.className = classes.join(' ');
+            
+            const timeHTML = timeInfo.unit 
+                ? `<span class="train-time ${timeInfo.className}">${timeInfo.text}<span class="unit">${timeInfo.unit}</span></span>`
+                : `<span class="train-time ${timeInfo.className}">${timeInfo.text}</span>`;
+            
+            row.innerHTML = `
+                <div class="train-badge ${arrival.routeId}">${arrival.routeId}</div>
+                <div class="train-info">
+                    ${timeHTML}
+                </div>
+            `;
+            
+            return row;
+        }
+        
+        function renderArrivals() {
+            state.renderScheduled = false;
+            
+            const isStale = state.lastSuccessfulFetch 
+                ? (Date.now() - state.lastSuccessfulFetch) > CONFIG.STALE_DATA_THRESHOLD
+                : true;
+            
+            const uptownFrag = document.createDocumentFragment();
+            const downtownFrag = document.createDocumentFragment();
+            
+            for (let i = 0; i < CONFIG.TRAINS_PER_DIRECTION; i++) {
+                uptownFrag.appendChild(createTrainRowElement(state.arrivals.uptown[i], isStale));
+                downtownFrag.appendChild(createTrainRowElement(state.arrivals.downtown[i], isStale));
+            }
+            
+            if (DOM.uptownTrains) {
+                DOM.uptownTrains.replaceChildren(uptownFrag);
+            }
+            if (DOM.downtownTrains) {
+                DOM.downtownTrains.replaceChildren(downtownFrag);
+            }
+            
+            if (isStale && !state.error) {
+                updateStatus('stale', 'Data may be outdated');
+            }
+        }
+        
+        function scheduleRender() {
+            if (state.renderScheduled) return;
+            state.renderScheduled = true;
+            requestAnimationFrame(() => {
+                renderArrivals();
+            });
+        }
+        
+        function updateStatus(type, message) {
+            if (DOM.status) {
+                DOM.status.className = `status ${type}`;
+            }
+            if (DOM.statusText) {
+                DOM.statusText.textContent = message;
+            }
+        }
+        
+        const timeFormatter = new Intl.DateTimeFormat('en-US', {
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true
+        });
+        
+        function updateClock() {
+            if (DOM.clock) {
+                DOM.clock.textContent = timeFormatter.format(new Date());
+            }
+        }
+        
+        function formatTime(date) {
+            return timeFormatter.format(date);
+        }
+
+        /**
+         * ================================================================
+         * SCHEDULING & LIFECYCLE
+         * ================================================================
+         */
+        
+        let refreshTimeoutId = null;
+        let clockIntervalId = null;
+        let renderIntervalId = null;
+        
+        const PAGE_REFRESH_INTERVAL = 4 * 60 * 60 * 1000;
+        setTimeout(() => {
+            console.log('🔄 Scheduled page refresh for memory management');
+            window.location.reload();
+        }, PAGE_REFRESH_INTERVAL);
+        
+        function scheduleRefresh(delay = CONFIG.REFRESH_INTERVAL) {
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+            }
+            
+            refreshTimeoutId = setTimeout(async () => {
+                await fetchAllArrivals();
+                scheduleRefresh();
+            }, delay);
+        }
+        
+        function cleanup() {
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+                refreshTimeoutId = null;
+            }
+            if (clockIntervalId) {
+                clearInterval(clockIntervalId);
+                clockIntervalId = null;
+            }
+            if (renderIntervalId) {
+                clearInterval(renderIntervalId);
+                renderIntervalId = null;
+            }
+        }
+        
+        async function init() {
+            console.log('🚇 Subway Display Starting...');
+            
+            cacheDOMRefs();
+            initStationSelector();
+            updateOnlineStatus();
+            
+            const station = getCurrentStationConfig();
+            console.log(`   Station: ${station.name} (${CONFIG.STATION_ID})`);
+            console.log(`   Routes: ${station.routes.join(', ')}`);
+            console.log(`   Refresh: ${CONFIG.REFRESH_INTERVAL}ms`);
+            
+            updateClock();
+            clockIntervalId = setInterval(updateClock, CONFIG.CLOCK_UPDATE_INTERVAL);
+            
+            await fetchAllArrivals();
+            scheduleRefresh();
+            
+            renderIntervalId = setInterval(() => {
+                const now = Math.floor(Date.now() / 1000);
+                state.arrivals.uptown = state.arrivals.uptown.filter(a => a.arrivalTime > now - 30);
+                state.arrivals.downtown = state.arrivals.downtown.filter(a => a.arrivalTime > now - 30);
+                scheduleRender();
+            }, 5000);
+            
+            console.log('🚇 Subway Display Ready');
+        }
+        
+        document.addEventListener('visibilitychange', async () => {
+            if (document.visibilityState === 'visible') {
+                updateOnlineStatus();
+                const timeSinceUpdate = state.lastSuccessfulFetch 
+                    ? Date.now() - state.lastSuccessfulFetch 
+                    : Infinity;
+                if (timeSinceUpdate > CONFIG.STALE_DATA_THRESHOLD) {
+                    await fetchAllArrivals();
+                }
+                scheduleRender();
+            }
+        });
+        
+        window.addEventListener('beforeunload', cleanup);
+        window.addEventListener('unload', cleanup);
+        
+        window.addEventListener('error', (event) => {
+            console.error('Global error:', event.error);
+        });
+        
+        window.addEventListener('unhandledrejection', (event) => {
+            console.error('Unhandled promise rejection:', event.reason);
+        });
+        
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', init);
+        } else {
+            init();
+        }
+    </script>
+</body>
+</html>
